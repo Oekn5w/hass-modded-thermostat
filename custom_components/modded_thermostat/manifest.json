@@ -3,6 +3,7 @@
   "name": "Modded Generic Thermostat",
   "documentation": "https://www.home-assistant.io/integrations/generic_thermostat",
   "dependencies": ["sensor", "switch"],
-  "version": "1.0",
-  "codeowners": []
+  "version": "1.1",
+  "codeowners": [],
+  "iot_class": "local_polling"
 }
