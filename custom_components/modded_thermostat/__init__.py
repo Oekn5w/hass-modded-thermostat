@@ -1,1 +1,1 @@
-"""The generic_thermostat component."""
+"""The modded_thermostat component."""

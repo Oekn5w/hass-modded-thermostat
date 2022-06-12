@@ -1,10 +1,10 @@
-"""Adds support for generic thermostat units."""
+"""Adds support for modded generic thermostat units."""
 import asyncio
 import logging
 
 import voluptuous as vol
 
-from homeassistant.components.climate import PLATFORM_SCHEMA, ClimateDevice
+from homeassistant.components.climate import PLATFORM_SCHEMA, ClimateEntity
 from homeassistant.components.climate.const import (
     ATTR_PRESET_MODE,
     CURRENT_HVAC_COOL,
@@ -19,6 +19,7 @@ from homeassistant.components.climate.const import (
     SUPPORT_PRESET_MODE,
     SUPPORT_TARGET_TEMPERATURE,
 )
+
 from homeassistant.const import (
     ATTR_ENTITY_ID,
     ATTR_TEMPERATURE,
@@ -33,7 +34,9 @@ from homeassistant.const import (
     STATE_UNAVAILABLE,
     STATE_UNKNOWN,
 )
+
 from homeassistant.core import DOMAIN as HA_DOMAIN, callback
+from homeassistant.exceptions import ConditionErrorMessage
 from homeassistant.helpers import condition
 import homeassistant.helpers.config_validation as cv
 from homeassistant.helpers.event import (
@@ -41,17 +44,21 @@ from homeassistant.helpers.event import (
     async_track_time_interval,
 )
 from homeassistant.helpers.restore_state import RestoreEntity
+from homeassistant.helpers.temperature import display_temp as show_temp
+from typing import Any, Dict
 
 _LOGGER = logging.getLogger(__name__)
 
 DEFAULT_TOLERANCE = 0.3
-DEFAULT_NAME = "Generic Thermostat"
+DEFAULT_NAME = "Modded Generic Thermostat"
+
+ATTR_ACTIVE_TARGET_TEMP = "default_target_temperature"
 
 CONF_HEATER = "heater"
 CONF_SENSOR = "target_sensor"
 CONF_MIN_TEMP = "min_temp"
 CONF_MAX_TEMP = "max_temp"
-CONF_TARGET_TEMP = "target_temp"
+CONF_ACT_TARGET_TEMP = "active_target_temp"
 CONF_AC_MODE = "ac_mode"
 CONF_MIN_DUR = "min_cycle_duration"
 CONF_COLD_TOLERANCE = "cold_tolerance"
@@ -73,7 +80,7 @@ PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend(
         vol.Optional(CONF_NAME, default=DEFAULT_NAME): cv.string,
         vol.Optional(CONF_COLD_TOLERANCE, default=DEFAULT_TOLERANCE): vol.Coerce(float),
         vol.Optional(CONF_HOT_TOLERANCE, default=DEFAULT_TOLERANCE): vol.Coerce(float),
-        vol.Optional(CONF_TARGET_TEMP): vol.Coerce(float),
+        vol.Optional(CONF_ACT_TARGET_TEMP): vol.Coerce(float),
         vol.Optional(CONF_KEEP_ALIVE): vol.All(cv.time_period, cv.positive_timedelta),
         vol.Optional(CONF_INITIAL_HVAC_MODE): vol.In(
             [HVAC_MODE_COOL, HVAC_MODE_HEAT, HVAC_MODE_OFF]
@@ -87,13 +94,13 @@ PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend(
 
 
 async def async_setup_platform(hass, config, async_add_entities, discovery_info=None):
-    """Set up the generic thermostat platform."""
+    """Set up the modded thermostat platform."""
     name = config.get(CONF_NAME)
     heater_entity_id = config.get(CONF_HEATER)
     sensor_entity_id = config.get(CONF_SENSOR)
     min_temp = config.get(CONF_MIN_TEMP)
     max_temp = config.get(CONF_MAX_TEMP)
-    target_temp = config.get(CONF_TARGET_TEMP)
+    active_target_temp = config.get(CONF_ACT_TARGET_TEMP)
     ac_mode = config.get(CONF_AC_MODE)
     min_cycle_duration = config.get(CONF_MIN_DUR)
     cold_tolerance = config.get(CONF_COLD_TOLERANCE)
@@ -106,13 +113,13 @@ async def async_setup_platform(hass, config, async_add_entities, discovery_info=
 
     async_add_entities(
         [
-            GenericThermostat(
+            ModdedThermostat(
                 name,
                 heater_entity_id,
                 sensor_entity_id,
                 min_temp,
                 max_temp,
-                target_temp,
+                active_target_temp,
                 ac_mode,
                 min_cycle_duration,
                 cold_tolerance,
@@ -127,7 +134,7 @@ async def async_setup_platform(hass, config, async_add_entities, discovery_info=
     )
 
 
-class GenericThermostat(ClimateDevice, RestoreEntity):
+class ModdedThermostat(ClimateEntity, RestoreEntity):
     """Representation of a Generic Thermostat device."""
 
     def __init__(
@@ -137,7 +144,7 @@ class GenericThermostat(ClimateDevice, RestoreEntity):
         sensor_entity_id,
         min_temp,
         max_temp,
-        target_temp,
+        active_target_temp,
         ac_mode,
         min_cycle_duration,
         cold_tolerance,
@@ -158,7 +165,7 @@ class GenericThermostat(ClimateDevice, RestoreEntity):
         self._hot_tolerance = hot_tolerance
         self._keep_alive = keep_alive
         self._hvac_mode = initial_hvac_mode
-        self._saved_target_temp = target_temp or away_temp
+        self._active_target_temp = active_target_temp
         self._temp_precision = precision
         if self.ac_mode:
             self._hvac_list = [HVAC_MODE_COOL, HVAC_MODE_OFF]
@@ -169,7 +176,7 @@ class GenericThermostat(ClimateDevice, RestoreEntity):
         self._temp_lock = asyncio.Lock()
         self._min_temp = min_temp
         self._max_temp = max_temp
-        self._target_temp = target_temp
+        self._target_temp = None
         self._unit = unit
         self._support_flags = SUPPORT_FLAGS
         if away_temp:
@@ -210,19 +217,19 @@ class GenericThermostat(ClimateDevice, RestoreEntity):
         old_state = await self.async_get_last_state()
         if old_state is not None:
             # If we have no initial temperature, restore
-            if self._target_temp is None:
+            if self._active_target_temp is None:
                 # If we have a previously saved temperature
-                if old_state.attributes.get(ATTR_TEMPERATURE) is None:
+                if old_state.attributes.get(ATTR_ACTIVE_TARGET_TEMP) is None:
                     if self.ac_mode:
-                        self._target_temp = self.max_temp
+                        self._active_target_temp = self.max_temp
                     else:
-                        self._target_temp = self.min_temp
+                        self._active_target_temp = self.min_temp
                     _LOGGER.warning(
-                        "Undefined target temperature, falling back to %s",
-                        self._target_temp,
+                        "Undefined default target temperature, falling back to %s",
+                        self._active_target_temp,
                     )
                 else:
-                    self._target_temp = float(old_state.attributes[ATTR_TEMPERATURE])
+                    self._active_target_temp = float(old_state.attributes[ATTR_ACTIVE_TARGET_TEMP])
             if old_state.attributes.get(ATTR_PRESET_MODE) == PRESET_AWAY:
                 self._is_away = True
             if not self._hvac_mode and old_state.state:
@@ -230,11 +237,11 @@ class GenericThermostat(ClimateDevice, RestoreEntity):
 
         else:
             # No previous state, try and restore defaults
-            if self._target_temp is None:
+            if self._active_target_temp is None:
                 if self.ac_mode:
-                    self._target_temp = self.max_temp
+                    self._active_target_temp = self.max_temp
                 else:
-                    self._target_temp = self.min_temp
+                    self._active_target_temp = self.min_temp
             _LOGGER.warning(
                 "No previously saved temperature, setting to %s", self._target_temp
             )
@@ -242,6 +249,28 @@ class GenericThermostat(ClimateDevice, RestoreEntity):
         # Set default state to off
         if not self._hvac_mode:
             self._hvac_mode = HVAC_MODE_OFF
+
+        # Now set the real target temp by querying the preset
+        if not self._is_away:
+            self._target_temp = self._active_target_temp
+        else:
+            self._target_temp = self._away_temp
+
+    @property
+    def state_attributes(self) -> Dict[str, Any]:
+        """Return the optional state attributes."""
+
+        data = super().state_attributes
+
+        if self._active_target_temp is not None:
+            data[ATTR_ACTIVE_TARGET_TEMP] = show_temp(
+                self.hass,
+                self._active_target_temp,
+                self.temperature_unit,
+                self.precision,
+            )
+
+        return data
 
     @property
     def should_poll(self):
@@ -332,9 +361,11 @@ class GenericThermostat(ClimateDevice, RestoreEntity):
         temperature = kwargs.get(ATTR_TEMPERATURE)
         if temperature is None:
             return
-        self._target_temp = temperature
+        self._active_target_temp = temperature
+        if not self._is_away:
+            self._target_temp = self._active_target_temp
         await self._async_control_heating(force=True)
-        await self.async_update_ha_state()
+        self.async_write_ha_state()
 
     @property
     def min_temp(self):
@@ -361,14 +392,14 @@ class GenericThermostat(ClimateDevice, RestoreEntity):
 
         self._async_update_temp(new_state)
         await self._async_control_heating()
-        await self.async_update_ha_state()
+        self.async_write_ha_state()
 
     @callback
     def _async_switch_changed(self, entity_id, old_state, new_state):
         """Handle heater switch state changes."""
         if new_state is None:
             return
-        self.async_schedule_update_ha_state()
+        self.async_write_ha_state()
 
     @callback
     def _async_update_temp(self, state):
@@ -385,7 +416,7 @@ class GenericThermostat(ClimateDevice, RestoreEntity):
                 self._active = True
                 _LOGGER.info(
                     "Obtained current and target temperature. "
-                    "Generic thermostat active. %s, %s",
+                    "Modded thermostat active. %s, %s",
                     self._cur_temp,
                     self._target_temp,
                 )
@@ -403,12 +434,16 @@ class GenericThermostat(ClimateDevice, RestoreEntity):
                         current_state = STATE_ON
                     else:
                         current_state = HVAC_MODE_OFF
-                    long_enough = condition.state(
-                        self.hass,
-                        self.heater_entity_id,
-                        current_state,
-                        self.min_cycle_duration,
-                    )
+                    try:
+                        long_enough = condition.state(
+                            self.hass,
+                            self.heater_entity_id,
+                            current_state,
+                            self.min_cycle_duration,
+                        )
+                    except ConditionErrorMessage:
+                        _LOGGER.warning("Heater %s not (yet) available.", self.heater_entity_id)
+                        return
                     if not long_enough:
                         return
 
@@ -420,7 +455,7 @@ class GenericThermostat(ClimateDevice, RestoreEntity):
                     await self._async_heater_turn_off()
                 elif time is not None:
                     # The time argument is passed only in keep-alive case
-                    _LOGGER.info(
+                    _LOGGER.debug(
                         "Keep-alive - Turning on heater heater %s",
                         self.heater_entity_id,
                     )
@@ -431,7 +466,7 @@ class GenericThermostat(ClimateDevice, RestoreEntity):
                     await self._async_heater_turn_on()
                 elif time is not None:
                     # The time argument is passed only in keep-alive case
-                    _LOGGER.info(
+                    _LOGGER.debug(
                         "Keep-alive - Turning off heater %s", self.heater_entity_id
                     )
                     await self._async_heater_turn_off()
@@ -460,12 +495,11 @@ class GenericThermostat(ClimateDevice, RestoreEntity):
         """Set new preset mode."""
         if preset_mode == PRESET_AWAY and not self._is_away:
             self._is_away = True
-            self._saved_target_temp = self._target_temp
             self._target_temp = self._away_temp
             await self._async_control_heating(force=True)
         elif preset_mode == PRESET_NONE and self._is_away:
             self._is_away = False
-            self._target_temp = self._saved_target_temp
+            self._target_temp = self._active_target_temp
             await self._async_control_heating(force=True)
 
-        await self.async_update_ha_state()
+        self.async_write_ha_state()
