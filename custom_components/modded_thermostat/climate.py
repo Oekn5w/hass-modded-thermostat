@@ -583,8 +583,6 @@ class ModdedThermostat(ClimateEntity, RestoreEntity):
             self._target_temp = self._active_target_temp
             await self._async_control_heating(force=True)
         else:
-            if self._attr_preset_mode == PRESET_NONE:
-                self._saved_target_temp = self._target_temp
             self._attr_preset_mode = preset_mode
             self._target_temp = self._presets[preset_mode]
             await self._async_control_heating(force=True)
